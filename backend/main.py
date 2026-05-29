@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +34,22 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 
 
+DOCUMENTS_FILE = "documents.json"
+
+def load_documents():
+    if not os.path.exists(DOCUMENTS_FILE):
+        return []
+    
+    with open(DOCUMENTS_FILE, "r") as f:
+        return json.load(f)
+    
+
+def save_documents(documents):
+    with open(DOCUMENTS_FILE, "w") as f:
+        json.dump(documents, f, indent=4)
+
+
+
 ## Models and Clients
 client = Groq(api_key = GROQ_API_KEY)
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -61,7 +78,32 @@ async def upload_pdf(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Only pdf files are allowed")
         
         document_id = str(uuid.uuid4())
+        documents = load_documents()
+
+        existing = next(
+            (
+                doc 
+                for doc in documents
+                if doc["filename"] == file.filename
+            ),
+            None
+        )
+        if existing:
+            return {
+                "message": "Document already exists",
+                "document_id": existing["document_id"],
+                "filename": existing["filename"]
+            }
+        
         filepath = os.path.join("uploads", f"{document_id}_{file.filename}")
+
+        documents.append({
+            "document_id": document_id,
+            "filename": file.filename,
+            "filepath": filepath
+        })
+        save_documents(documents)
+
 
         ## save file
         with open(filepath, "wb") as f:
@@ -106,6 +148,12 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@app.get("/documents")
+def get_documents():
+    return load_documents()
+
+
 ## Ask question endpoint
 @app.post("/ask")
 async def ask_question(data: dict):
@@ -133,11 +181,15 @@ async def ask_question(data: dict):
         prompt = f"""
         You are a helpful AI assistant.
 
-        Answer ONLY using the provided context.
+        Answer using ONLY the provided context.
 
-        If the answer is not present in the context,
-        reply exactly:
+        Keep answers concise and easy to read.
 
+        Rules:
+        - For definitions, give a short explanation.
+        - For lists, use bullet points.
+        - Do not add information that is not present in the context.
+        - If the answer is not present in the context, reply exactly:
         "I couldn't find that in the document."
 
         CONTEXT:
@@ -168,6 +220,43 @@ async def ask_question(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+
+## Delete endpoint
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+    try:
+        documents = load_documents()
+        document = next(
+            (
+                doc
+                for doc in documents
+                if doc["document_id"] == document_id
+            ),
+            None
+        )
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        # Delete PDF file
+        if os.path.exists(document["filepath"]):
+            os.remove(document["filepath"])
+
+        # Delete Embeddings from ChromaDB
+        collection.delete(where={"document_id": document_id})
+
+        # Remove from documents.json
+        documents = [
+            doc
+            for doc in documents
+            if doc["document_id"] != document_id
+        ]
+        save_documents(documents)
+
+        return {"message": "Document deleted successfully"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 ## health check endpoint
 @app.get("/")
